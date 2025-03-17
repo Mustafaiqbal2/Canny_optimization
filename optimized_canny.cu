@@ -9,7 +9,7 @@ typedef long long fixed;
 #include <math.h>
 #include <cuda_runtime.h>
 #include "optimized_hysteresis.cu"
-
+#include "optimized_pgm_io.c"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -21,9 +21,6 @@ void gaussian_smooth_cuda(unsigned char *h_image, int rows, int cols, float sigm
 void derivative_x_y_cuda(short int *h_smoothedim, int rows, int cols,
                        short int **h_delta_x, short int **h_delta_y);
                        
-void radian_direction_cuda(short int *h_delta_x, short int *h_delta_y, int rows, int cols, 
-                         float **h_dir_radians, int xdirtag, int ydirtag);
-                         
 void magnitude_x_y_cuda(short int *h_delta_x, short int *h_delta_y, int rows, int cols,
                       short int **h_magnitude);
                       
@@ -38,14 +35,9 @@ int read_pgm_image(char *infilename, unsigned char **image, int *rows,
     int *cols);
 int write_pgm_image(char *outfilename, unsigned char *image, int rows,
     int cols, char *comment, int maxval);
-
-void canny(unsigned char *image, int rows, int cols, float sigma,
-         float tlow, float thigh, unsigned char **edge, char *fname);
-void gaussian_smooth(unsigned char *image, int rows, int cols, float sigma,
-        short int **smoothedim);
+    
 void make_gaussian_kernel(float sigma, float **kernel, int *windowsize);
 
-double angle_radians(double x, double y);
 void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
          float tlow, float thigh, unsigned char **edge, char *fname);
 
@@ -153,13 +145,11 @@ int main(int argc, char *argv[])
 void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
          float tlow, float thigh, unsigned char **edge, char *fname)
 {
-   FILE *fpdir=NULL;          /* File to write the gradient image to.     */
    unsigned char *nms;        /* Points that are local maximal magnitude. */
    short int *smoothedim,     /* The image after gaussian smoothing.      */
              *delta_x,        /* The first devivative image, x-direction. */
              *delta_y,        /* The first derivative image, y-direction. */
              *magnitude;      /* The magnitude of the gadient image.      */
-   float *dir_radians=NULL;   /* Gradient direction image.                */
 
    /****************************************************************************
    * Perform gaussian smoothing on the image using the input standard
@@ -179,31 +169,6 @@ void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
    ****************************************************************************/
    derivative_x_y_cuda(smoothedim, rows, cols, &delta_x, &delta_y);
 
-   /****************************************************************************
-   * This option to write out the direction of the edge gradient was added
-   * to make the information available for computing an edge quality figure
-   * of merit.
-   ****************************************************************************/
-   if(fname != NULL)
-   {
-      /*************************************************************************
-      * Compute the direction up the gradient, in radians that are
-      * specified counteclockwise from the positive x-axis. (CUDA accelerated)
-      *************************************************************************/
-      radian_direction_cuda(delta_x, delta_y, rows, cols, &dir_radians, -1, -1);
-
-      /*************************************************************************
-      * Write the gradient direction image out to a file.
-      *************************************************************************/
-      if((fpdir = fopen(fname, "wb")) == NULL)
-      {
-         fprintf(stderr, "Error opening the file %s for writing.\n", fname);
-         exit(1);
-      }
-      fwrite(dir_radians, sizeof(float), rows*cols, fpdir);
-      fclose(fpdir);
-      free(dir_radians);
-   }
 
    /****************************************************************************
    * Compute the magnitude of the gradient. (CUDA accelerated)
@@ -241,27 +206,6 @@ void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
    free(delta_y);
    free(magnitude);
    free(nms);
-}
-
-double angle_radians(double x, double y)
-{
-   double xu, yu, ang;
-
-   xu = fabs(x);
-   yu = fabs(y);
-
-   if((xu == 0) && (yu == 0)) return(0);
-
-   ang = atan(yu/xu);
-
-   if(x >= 0){
-      if(y >= 0) return(ang);
-      else return(2*M_PI - ang);
-   }
-   else{
-      if(y >= 0) return(M_PI - ang);
-      else return(M_PI + ang);
-   }
 }
 
 __global__ void derivative_x_y_kernel(short int *d_smoothedim, int rows, int cols, 
@@ -548,86 +492,4 @@ void magnitude_x_y_cuda(short int *h_delta_x, short int *h_delta_y, int rows, in
     cudaFree(d_delta_x);
     cudaFree(d_delta_y);
     cudaFree(d_magnitude);
-}
-
-// Device version of angle_radians function
-__device__ float angle_radians_device(double x, double y)
-{
-   double xu, yu, ang;
-
-   xu = fabs(x);
-   yu = fabs(y);
-
-   if((xu == 0) && (yu == 0)) return(0);
-
-   ang = atan(yu/xu);
-
-   if(x >= 0){
-      if(y >= 0) return(ang);
-      else return(2*M_PI - ang);
-   }
-   else{
-      if(y >= 0) return(M_PI - ang);
-      else return(M_PI + ang);
-   }
-}
-
-__global__ void radian_direction_kernel(short int *d_delta_x, short int *d_delta_y, 
-                                      int rows, int cols, float *d_dir_radians,
-                                      int xdirtag, int ydirtag)
-{
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (r < rows && c < cols) {
-        int pos = r * cols + c;
-        double dx = (double)d_delta_x[pos];
-        double dy = (double)d_delta_y[pos];
-        
-        if(xdirtag == 1) dx = -dx;
-        if(ydirtag == -1) dy = -dy;
-        
-        d_dir_radians[pos] = angle_radians_device(dx, dy);
-    }
-}
-
-// Host function
-void radian_direction_cuda(short int *h_delta_x, short int *h_delta_y, int rows, int cols, 
-                         float **h_dir_radians, int xdirtag, int ydirtag)
-{
-    // Allocate host memory for output
-    *h_dir_radians = (float*)malloc(rows * cols * sizeof(float));
-    if(*h_dir_radians == NULL) {
-        fprintf(stderr, "Error allocating the gradient direction image.\n");
-        exit(1);
-    }
-    
-    // Allocate device memory
-    short int *d_delta_x, *d_delta_y;
-    float *d_dir_radians;
-    
-    cudaMalloc((void**)&d_delta_x, rows * cols * sizeof(short int));
-    cudaMalloc((void**)&d_delta_y, rows * cols * sizeof(short int));
-    cudaMalloc((void**)&d_dir_radians, rows * cols * sizeof(float));
-    
-    // Copy input to device
-    cudaMemcpy(d_delta_x, h_delta_x, rows * cols * sizeof(short int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_delta_y, h_delta_y, rows * cols * sizeof(short int), cudaMemcpyHostToDevice);
-    
-    // Set up grid and block dimensions
-    dim3 blockSize(16, 16);
-    dim3 gridSize((cols + blockSize.x - 1) / blockSize.x, 
-                 (rows + blockSize.y - 1) / blockSize.y);
-    
-    // Launch kernel
-    radian_direction_kernel<<<gridSize, blockSize>>>(d_delta_x, d_delta_y, rows, cols, 
-                                                  d_dir_radians, xdirtag, ydirtag);
-    
-    // Copy results back to host
-    cudaMemcpy(*h_dir_radians, d_dir_radians, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    // Free device memory
-    cudaFree(d_delta_x);
-    cudaFree(d_delta_y);
-    cudaFree(d_dir_radians);
 }

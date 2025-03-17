@@ -1,11 +1,10 @@
 # Compiler settings
 NVCC = nvcc
 CC = gcc
-NVCC_FLAGS = -O3 -arch=sm_70 -Xcompiler -Wall
 CC_FLAGS = -O3 -Wall
 
 # If you don't know your GPU architecture, comment out the line above and uncomment this one:
-# NVCC_FLAGS = -O3 -arch=compute_50 -code=sm_50 -Xcompiler -Wall
+NVCC_FLAGS = -O3 -arch=compute_50 -code=sm_50 -Xcompiler -Wall
 
 # Libraries
 CUDA_LIBS = -lcudart
@@ -28,8 +27,8 @@ all: $(TARGET)
 
 $(TARGET): $(CUDA_SRCS) $(OBJ_FILES)
 	$(NVCC) $(NVCC_FLAGS) -o $@ $^ $(CUDA_LIBS)
-optimized_pgm_io.o: optimized_pgm_io.cu
-	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+optimized_pgm_io.o: optimized_pgm_io.c
+	$(CC) $(CC_FLAGS) -c $< -o $@
 run: $(TARGET)
 	./$(TARGET) $(PIC) 2.5 0.25 0.5
 # 			      sigma tlow thigh
