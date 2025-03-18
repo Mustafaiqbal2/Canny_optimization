@@ -4,7 +4,7 @@ CC = gcc
 CC_FLAGS = -O3 -Wall
 
 # If you don't know your GPU architecture, comment out the line above and uncomment this one:
-NVCC_FLAGS = -O3 -arch=compute_50 -code=sm_50 -Xcompiler -Wall
+NVCC_FLAGS = -O3 -arch=sm_70 -Xcompiler -Wall
 
 # Libraries
 CUDA_LIBS = -lcudart
