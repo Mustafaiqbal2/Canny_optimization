@@ -15,29 +15,6 @@ typedef long long fixed;
 #define M_PI 3.14159265358979323846
 #endif
 
-void gaussian_smooth_cuda(unsigned char *h_image, int rows, int cols, float sigma, 
-                        short int *h_smoothedim);
-                        
-void derivative_x_y_cuda(short int *h_smoothedim, int rows, int cols,
-                       short int **h_delta_x, short int **h_delta_y);
-                       
-void magnitude_x_y_cuda(short int *h_delta_x, short int *h_delta_y, int rows, int cols,
-                      short int **h_magnitude);
-                      
-void non_max_supp_cuda(short *h_mag, short *h_gradx, short *h_grady, 
-                     int rows, int cols, unsigned char *h_result);
-                     
-void apply_hysteresis_cuda(short int *h_mag, unsigned char *h_nms, int rows, int cols,
-                         float tlow, float thigh, unsigned char *h_edge);
-
-
-int read_pgm_image(char *infilename, unsigned char **image, int *rows,
-    int *cols);
-int write_pgm_image(char *outfilename, unsigned char *image, int rows,
-    int cols, char *comment, int maxval);
-    
-void make_gaussian_kernel(float sigma, float **kernel, int *windowsize);
-
 void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
          float tlow, float thigh, unsigned char **edge, char *fname);
 
@@ -90,11 +67,16 @@ int main(int argc, char *argv[])
    /****************************************************************************
    * Read in the image. This read function allocates memory for the image.
    ****************************************************************************/
-   if(read_pgm_image(infilename, &image, &rows, &cols) == 0){
-      fprintf(stderr, "Error reading the input image, %s.\n", infilename);
-      exit(1);
-   }
-
+  unsigned char *temp_image;
+  if(read_pgm_image(infilename, &temp_image, &rows, &cols) == 0){
+     fprintf(stderr, "Error reading the input image, %s.\n", infilename);
+     exit(1);
+  }
+  
+  // Transfer to pinned memory for better CUDA performance
+  cudaMallocHost((void**)&image, rows * cols * sizeof(unsigned char));
+  memcpy(image, temp_image, rows * cols * sizeof(unsigned char));
+  free(temp_image);
    /****************************************************************************
    * Perform the edge detection. All of the work takes place here.
    ****************************************************************************/
@@ -137,137 +119,45 @@ int main(int argc, char *argv[])
       exit(1);
    }
 
-   free(image);
+   cudaFreeHost(image);
    return 0;
 }
 
-
-void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
-         float tlow, float thigh, unsigned char **edge, char *fname)
-{
-   unsigned char *nms;        /* Points that are local maximal magnitude. */
-   short int *smoothedim,     /* The image after gaussian smoothing.      */
-             *delta_x,        /* The first devivative image, x-direction. */
-             *delta_y,        /* The first derivative image, y-direction. */
-             *magnitude;      /* The magnitude of the gadient image.      */
-
-   /****************************************************************************
-   * Perform gaussian smoothing on the image using the input standard
-   * deviation. (CUDA accelerated)
-   ****************************************************************************/
-   // Allocate memory for smoothedim
-   smoothedim = (short int *)malloc(rows * cols * sizeof(short int));
-   if(smoothedim == NULL) {
-      fprintf(stderr, "Error allocating the smoothed image.\n");
-      exit(1);
-   }
-   // Call CUDA version of gaussian_smooth
-   gaussian_smooth_cuda(image, rows, cols, sigma, smoothedim);
-
-   /****************************************************************************
-   * Compute the first derivative in the x and y directions. (CUDA accelerated)
-   ****************************************************************************/
-   derivative_x_y_cuda(smoothedim, rows, cols, &delta_x, &delta_y);
-
-
-   /****************************************************************************
-   * Compute the magnitude of the gradient. (CUDA accelerated)
-   ****************************************************************************/
-   magnitude_x_y_cuda(delta_x, delta_y, rows, cols, &magnitude);
-
-   /****************************************************************************
-   * Perform non-maximal suppression.
-   * TODO: Implement non_max_supp_cuda in optimized_canny_kernels.cu
-   ****************************************************************************/
-   if((nms = (unsigned char *) malloc(rows*cols*sizeof(unsigned char)))==NULL)
-   {
-      fprintf(stderr, "Error allocating the nms image.\n");
-      exit(1);
-   }
-   non_max_supp_cuda(magnitude, delta_x, delta_y, rows, cols, nms);
-
-   /****************************************************************************
-   * Use hysteresis to mark the edge pixels.
-   * TODO: Implement apply_hysteresis_cuda in optimized_hysteresis.cu
-   ****************************************************************************/
-   if((*edge=(unsigned char *)malloc(rows*cols*sizeof(unsigned char))) ==NULL)
-   {
-      fprintf(stderr, "Error allocating the edge image.\n");
-      exit(1);
-   }
-   apply_hysteresis_cuda(magnitude, nms, rows, cols, tlow, thigh, *edge);
-
-   /****************************************************************************
-   * Free all of the memory that we allocated except for the edge image that
-   * is still being used to store out result.
-   ****************************************************************************/
-   free(smoothedim);
-   free(delta_x);
-   free(delta_y);
-   free(magnitude);
-   free(nms);
-}
-
-__global__ void derivative_x_y_kernel(short int *d_smoothedim, int rows, int cols, 
-   short int *d_delta_x, short int *d_delta_y)
+__global__ void derivative_magnitude_kernel(short int *d_smoothedim, int rows, int cols, 
+                                           short int *d_magnitude, short int *d_delta_x, short int *d_delta_y)
 {
    int c = blockIdx.x * blockDim.x + threadIdx.x;
    int r = blockIdx.y * blockDim.y + threadIdx.y;
    int pos = r * cols + c;
 
-   if (r < rows && c < cols) 
-   {
+   if (r < rows && c < cols) {
       // X derivative
+      short int dx;
       if (c == 0)
-         d_delta_x[pos] = d_smoothedim[pos+1] - d_smoothedim[pos];
+         dx = d_smoothedim[pos+1] - d_smoothedim[pos];
       else if (c == cols-1)
-         d_delta_x[pos] = d_smoothedim[pos] - d_smoothedim[pos-1];
+         dx = d_smoothedim[pos] - d_smoothedim[pos-1];
       else
-         d_delta_x[pos] = d_smoothedim[pos+1] - d_smoothedim[pos-1];
-
+         dx = d_smoothedim[pos+1] - d_smoothedim[pos-1];
+      
       // Y derivative
+      short int dy;
       if (r == 0)
-         d_delta_y[pos] = d_smoothedim[pos+cols] - d_smoothedim[pos];
+         dy = d_smoothedim[pos+cols] - d_smoothedim[pos];
       else if (r == rows-1)
-         d_delta_y[pos] = d_smoothedim[pos] - d_smoothedim[pos-cols];
+         dy = d_smoothedim[pos] - d_smoothedim[pos-cols];
       else
-         d_delta_y[pos] = d_smoothedim[pos+cols] - d_smoothedim[pos-cols];
+         dy = d_smoothedim[pos+cols] - d_smoothedim[pos-cols];
+      
+      // Store derivatives for later use in non-max suppression
+      d_delta_x[pos] = dx;
+      d_delta_y[pos] = dy;
+      
+      // Calculate magnitude in the same kernel
+      int sq1 = (int)dx * (int)dx;
+      int sq2 = (int)dy * (int)dy;
+      d_magnitude[pos] = (short)(0.5f + sqrtf((float)sq1 + (float)sq2));
    }
-}
-
-   // Host function
-void derivative_x_y_cuda(short int *h_smoothedim, int rows, int cols,
-   short int **h_delta_x, short int **h_delta_y)
-{
-   // Allocate host memory for output
-   *h_delta_x = (short int*)malloc(rows * cols * sizeof(short int));
-   *h_delta_y = (short int*)malloc(rows * cols * sizeof(short int));
-
-   // Allocate device memory
-   short int *d_smoothedim, *d_delta_x, *d_delta_y;
-   cudaMalloc((void**)&d_smoothedim, rows * cols * sizeof(short int));
-   cudaMalloc((void**)&d_delta_x, rows * cols * sizeof(short int));
-   cudaMalloc((void**)&d_delta_y, rows * cols * sizeof(short int));
-
-   // Copy input to device
-   cudaMemcpy(d_smoothedim, h_smoothedim, rows * cols * sizeof(short int),
-   cudaMemcpyHostToDevice);
-
-   // Launch kernel
-   dim3 blockSize(16, 16);
-   dim3 gridSize((cols + blockSize.x - 1) / blockSize.x,
-   (rows + blockSize.y - 1) / blockSize.y);
-
-   derivative_x_y_kernel<<<gridSize, blockSize>>>(d_smoothedim, rows, cols, d_delta_x, d_delta_y);
-
-   // Copy results back to host
-   cudaMemcpy(*h_delta_x, d_delta_x, rows * cols * sizeof(short int), cudaMemcpyDeviceToHost);
-   cudaMemcpy(*h_delta_y, d_delta_y, rows * cols * sizeof(short int), cudaMemcpyDeviceToHost);
-
-   // Free device memory
-   cudaFree(d_smoothedim);
-   cudaFree(d_delta_x);
-   cudaFree(d_delta_y);
 }
 
 
@@ -279,7 +169,6 @@ void make_gaussian_kernel(float sigma, float **kernel, int *windowsize)
    *windowsize = 1 + 2 * ceil(2.5 * sigma);
    center = (*windowsize) / 2;
 
-   if(VERBOSE) printf("      The kernel has %d elements.\n", *windowsize);
    if((*kernel = (float *) malloc((*windowsize)* sizeof(float))) == NULL){
       fprintf(stderr, "Error callocing the gaussian kernel array.\n");
       exit(1);
@@ -297,8 +186,8 @@ void make_gaussian_kernel(float sigma, float **kernel, int *windowsize)
 
 
 __global__ void opt_gaussian_smooth_x_kernel(unsigned char *d_image, int rows, int cols, 
-   float *d_kernel, int windowsize,
-   float *d_tempim)
+float *d_kernel, int windowsize,
+float *d_tempim)
 {
    // Get the half size of the kernel (radius)
    int center = windowsize / 2;
@@ -324,23 +213,23 @@ __global__ void opt_gaussian_smooth_x_kernel(unsigned char *d_image, int rows, i
    if (r < rows && c < cols) {
       float dot = 0.0f;
       float sum = 0.0f;
-      
+
       // Perform convolution in X direction
       for(int cc = -center; cc <= center; cc++) {
          if(((c+cc) >= 0) && ((c+cc) < cols)) {
             dot += (float)d_image[r*cols+(c+cc)] * s_kernel[center+cc];
             sum += s_kernel[center+cc];
          }
-      }
-      
-      // Store result in temporary buffer
-      d_tempim[r*cols+c] = dot/sum;
+   }
+
+   // Store result in temporary buffer
+   d_tempim[r*cols+c] = dot/sum;
    }
 }
 
 __global__ void opt_gaussian_smooth_y_kernel(float *d_tempim, int rows, int cols, 
-   float *d_kernel, int windowsize,
-   short int *d_smoothedim)
+float *d_kernel, int windowsize,
+short int *d_smoothedim)
 {
    // Get the half size of the kernel (radius)
    int center = windowsize / 2;
@@ -383,113 +272,273 @@ __global__ void opt_gaussian_smooth_y_kernel(float *d_tempim, int rows, int cols
    }
 }
 
-// On the host (CPU)
-void gaussian_smooth_cuda(unsigned char *h_image, int rows, int cols, float sigma, 
-   short int *h_smoothedim)
+
+void complete_canny_pipeline_cuda(unsigned char *h_image, int rows, int cols, 
+   float sigma, float tlow, float thigh, 
+   unsigned char *h_edge)
 {
-   // Create the Gaussian kernel on the host
+   // Timing variables
+   cudaEvent_t start, stop;
+   float milliseconds = 0.0f;
+   float total_kernel_time = 0.0f;
+   float total_transfer_time = 0.0f;
+   float total_cpu_time = 0.0f;
+   
+   // Create events for timing
+   cudaEventCreate(&start);
+   cudaEventCreate(&stop);
+   
+   printf("\n----- TIMING BREAKDOWN -----\n");
+   
+   
+   // Create the Gaussian kernel
    float *h_kernel;
    int windowsize;
    make_gaussian_kernel(sigma, &h_kernel, &windowsize);
 
-   // Allocate device memory for kernel
-   float *d_kernel;
-   cudaMalloc((void**)&d_kernel, windowsize * sizeof(float));
 
-   // Copy kernel to device
-   cudaMemcpy(d_kernel, h_kernel, windowsize * sizeof(float), cudaMemcpyHostToDevice);
-
-   // Allocate device memory for image, temp image, and result
+   // Allocate device memory
+   cudaEventRecord(start, 0);
+   
    unsigned char *d_image;
-   float *d_tempim;
-   short int *d_smoothedim;
+   float *d_tempim, *d_kernel;
+   short int *d_smoothedim, *d_gradx, *d_grady, *d_magnitude;
+   unsigned char *d_nms, *d_edge;
+   int *d_hist, *d_changes;
 
+   // Allocate all required device memory at once
    cudaMalloc((void**)&d_image, rows * cols * sizeof(unsigned char));
    cudaMalloc((void**)&d_tempim, rows * cols * sizeof(float));
+   cudaMalloc((void**)&d_kernel, windowsize * sizeof(float));
    cudaMalloc((void**)&d_smoothedim, rows * cols * sizeof(short int));
+   cudaMalloc((void**)&d_gradx, rows * cols * sizeof(short int));
+   cudaMalloc((void**)&d_grady, rows * cols * sizeof(short int));
+   cudaMalloc((void**)&d_magnitude, rows * cols * sizeof(short int));
+   cudaMalloc((void**)&d_nms, rows * cols * sizeof(unsigned char));
+   cudaMalloc((void**)&d_edge, rows * cols * sizeof(unsigned char));
+   cudaMalloc((void**)&d_hist, 32768 * sizeof(int));
+   cudaMalloc((void**)&d_changes, sizeof(int));
+   
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Memory: Device allocation: %.3f ms\n", milliseconds);
+   
+   // Initialize histogram to zeros
+   
+   cudaMemset(d_hist, 0, 32768 * sizeof(int));
 
-   // Copy input image to device
+
+   // Copy input data to device
+   cudaEventRecord(start, 0);
    cudaMemcpy(d_image, h_image, rows * cols * sizeof(unsigned char), cudaMemcpyHostToDevice);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Transfer: Image to device: %.3f ms\n", milliseconds);
+   total_transfer_time += milliseconds;
+   
+   cudaMemcpy(d_kernel, h_kernel, windowsize * sizeof(float), cudaMemcpyHostToDevice);
 
    // Set up grid and block dimensions
    dim3 blockSize(16, 16);
-   dim3 gridSize((cols + blockSize.x - 1) / blockSize.x, 
-                (rows + blockSize.y - 1) / blockSize.y);
+   dim3 gridSize((cols + blockSize.x - 1) / blockSize.x, (rows + blockSize.y - 1) / blockSize.y);
 
-   // First pass: X-direction blur
+   // Step 1: Gaussian smooth X direction
+   cudaEventRecord(start, 0);
    opt_gaussian_smooth_x_kernel<<<gridSize, blockSize, windowsize * sizeof(float)>>>(
-      d_image, rows, cols, d_kernel, windowsize, d_tempim);
+   d_image, rows, cols, d_kernel, windowsize, d_tempim);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Kernel: Gaussian X direction: %.3f ms\n", milliseconds);
+   total_kernel_time += milliseconds;
 
-   // Wait for X-direction kernel to finish
-   cudaDeviceSynchronize();
-   
-   // Second pass: Y-direction blur
+   // Step 2: Gaussian smooth Y direction
+   cudaEventRecord(start, 0);
    opt_gaussian_smooth_y_kernel<<<gridSize, blockSize, windowsize * sizeof(float)>>>(
-      d_tempim, rows, cols, d_kernel, windowsize, d_smoothedim);
-   
-   // Wait for Y-direction kernel to finish
-   cudaDeviceSynchronize();
+   d_tempim, rows, cols, d_kernel, windowsize, d_smoothedim);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Kernel: Gaussian Y direction: %.3f ms\n", milliseconds);
+   total_kernel_time += milliseconds;
+
+   // Step 3: Compute derivatives and magnitude
+   cudaEventRecord(start, 0);
+   derivative_magnitude_kernel<<<gridSize, blockSize>>>(
+   d_smoothedim, rows, cols, d_magnitude, d_gradx, d_grady);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Kernel: Derivatives and magnitude: %.3f ms\n", milliseconds);
+   total_kernel_time += milliseconds;
+
+   // Step 4: Non-maximum suppression
+   cudaEventRecord(start, 0);
+   non_max_supp_kernel<<<gridSize, blockSize>>>(
+   d_magnitude, d_gradx, d_grady, rows, cols, d_nms);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Kernel: Non-maximum suppression: %.3f ms\n", milliseconds);
+   total_kernel_time += milliseconds;
+
+   // Step 5: Initialize edges and histogram
+   cudaEventRecord(start, 0);
+   init_edges_kernel<<<gridSize, blockSize>>>(
+   d_nms, d_edge, d_magnitude, d_hist, rows, cols);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Kernel: Edge initialization: %.3f ms\n", milliseconds);
+   total_kernel_time += milliseconds;
+
+   // Compute thresholds - CPU
+   cudaEventRecord(start, 0);
+   int *h_hist = (int*)malloc(32768 * sizeof(int));
+   cudaMemcpy(h_hist, d_hist, 32768 * sizeof(int), cudaMemcpyDeviceToHost);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Transfer: Histogram to host: %.3f ms\n", milliseconds);
+   total_transfer_time += milliseconds;
+
+   // CPU threshold computation
+   cudaEventRecord(start, 0);
+   int numedges = 0, maximum_mag = 0;
+   for (int r = 1; r < 32768; r++) {
+      if (h_hist[r] != 0) maximum_mag = r;
+      numedges += h_hist[r];
+   }
+
+   int highcount = (int)(numedges * thigh + 0.5);
+   int r = 1;
+   numedges = h_hist[1];
+   while ((r < (maximum_mag-1)) && (numedges < highcount)) {
+      r++;
+      numedges += h_hist[r];
+   }
+
+   int highthreshold = r;
+   int lowthreshold = (int)(highthreshold * tlow + 0.5);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("CPU: Threshold computation: %.3f ms\n", milliseconds);
+   total_cpu_time += milliseconds;
+
+   // Step 6: Apply threshold
+   cudaEventRecord(start, 0);
+   apply_threshold_kernel<<<gridSize, blockSize>>>(
+   d_edge, d_magnitude, highthreshold, rows, cols);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Kernel: Threshold application: %.3f ms\n", milliseconds);
+   total_kernel_time += milliseconds;
+
+   // Step 7: Iterative hysteresis expansion
+   int h_changes = 1;
+   int iteration = 0;
+   float hysteresis_time = 0.0f;
+
+   while (h_changes) {
+      h_changes = 0;
+      
+      cudaEventRecord(start, 0);
+      cudaMemcpy(d_changes, &h_changes, sizeof(int), cudaMemcpyHostToDevice);
+      cudaEventRecord(stop, 0);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&milliseconds, start, stop);
+      total_transfer_time += milliseconds;
+      
+      bool final_pass = iteration >= 4;
+
+      cudaEventRecord(start, 0);
+      expansion_and_cleanup_kernel<<<gridSize, blockSize>>>(
+      d_edge, d_magnitude, lowthreshold, rows, cols, d_changes, final_pass);
+      cudaEventRecord(stop, 0);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&milliseconds, start, stop);
+      hysteresis_time += milliseconds;
+      total_kernel_time += milliseconds;
+      
+      cudaEventRecord(start, 0);
+      cudaMemcpy(&h_changes, d_changes, sizeof(int), cudaMemcpyDeviceToHost);
+      cudaEventRecord(stop, 0);
+      cudaEventSynchronize(stop);
+      cudaEventElapsedTime(&milliseconds, start, stop);
+      total_transfer_time += milliseconds;
+
+      if (!h_changes && !final_pass) {
+         final_pass = true;
+         
+         cudaEventRecord(start, 0);
+         expansion_and_cleanup_kernel<<<gridSize, blockSize>>>(
+         d_edge, d_magnitude, lowthreshold, rows, cols, d_changes, final_pass);
+         cudaEventRecord(stop, 0);
+         cudaEventSynchronize(stop);
+         cudaEventElapsedTime(&milliseconds, start, stop);
+         hysteresis_time += milliseconds;
+         total_kernel_time += milliseconds;
+         
+         break;
+      }
+
+      iteration++;
+   }
+   printf("Kernel: Hysteresis expansion (%d iterations): %.3f ms\n", iteration, hysteresis_time);
 
    // Copy final result back to host
-   cudaMemcpy(h_smoothedim, d_smoothedim, rows * cols * sizeof(short int), cudaMemcpyDeviceToHost);
+   cudaEventRecord(start, 0);
+   cudaMemcpy(h_edge, d_edge, rows * cols * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Transfer: Result to host: %.3f ms\n", milliseconds);
+   total_transfer_time += milliseconds;
 
-   // Free device memory
-   cudaFree(d_kernel);
+   // Free all device memory
+   cudaEventRecord(start, 0);
    cudaFree(d_image);
    cudaFree(d_tempim);
+   cudaFree(d_kernel);
    cudaFree(d_smoothedim);
+   cudaFree(d_gradx);
+   cudaFree(d_grady);
+   cudaFree(d_magnitude);
+   cudaFree(d_nms);
+   cudaFree(d_edge);
+   cudaFree(d_hist);
+   cudaFree(d_changes);
+   cudaEventRecord(stop, 0);
+   cudaEventSynchronize(stop);
+   cudaEventElapsedTime(&milliseconds, start, stop);
+   printf("Memory: Device cleanup: %.3f ms\n", milliseconds);
 
    // Free host memory
    free(h_kernel);
+   free(h_hist);
+   
+   // Print summary
+   printf("Total CPU time: %.3f ms\n", total_cpu_time);
+   printf("Total kernel execution time: %.3f ms\n", total_kernel_time);
+   printf("Total memory transfer time: %.3f ms\n", total_transfer_time);
+   
+   // Cleanup timing events
+   cudaEventDestroy(start);
+   cudaEventDestroy(stop);
 }
-
-__global__ void magnitude_x_y_kernel(short int *d_delta_x, short int *d_delta_y, 
-                                    int rows, int cols, short int *d_magnitude) 
+void canny_cuda(unsigned char *image, int rows, int cols, float sigma,
+   float tlow, float thigh, unsigned char **edge, char *fname)
 {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
-    int pos = r * cols + c;
-    
-    if (r < rows && c < cols) {
-        int sq1 = (int)d_delta_x[pos] * (int)d_delta_x[pos];
-        int sq2 = (int)d_delta_y[pos] * (int)d_delta_y[pos];
-        d_magnitude[pos] = (short)(0.5f + sqrtf((float)sq1 + (float)sq2));
-    }
-}
+   // Allocate output memory for the edge image
+   if((*edge=(unsigned char *)malloc(rows*cols*sizeof(unsigned char))) == NULL) {
+      fprintf(stderr, "Error allocating the edge image.\n");
+      exit(1);
+   }
 
-// Host function
-void magnitude_x_y_cuda(short int *h_delta_x, short int *h_delta_y, int rows, int cols,
-                       short int **h_magnitude) 
-{
-    // Allocate host memory for output
-    *h_magnitude = (short int*)malloc(rows * cols * sizeof(short int));
-    if(*h_magnitude == NULL) {
-        fprintf(stderr, "Error allocating the magnitude image.\n");
-        exit(1);
-    }
-    
-    // Allocate device memory
-    short int *d_delta_x, *d_delta_y, *d_magnitude;
-    cudaMalloc((void**)&d_delta_x, rows * cols * sizeof(short int));
-    cudaMalloc((void**)&d_delta_y, rows * cols * sizeof(short int));
-    cudaMalloc((void**)&d_magnitude, rows * cols * sizeof(short int));
-    
-    // Copy input to device
-    cudaMemcpy(d_delta_x, h_delta_x, rows * cols * sizeof(short int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_delta_y, h_delta_y, rows * cols * sizeof(short int), cudaMemcpyHostToDevice);
-    
-    // Launch kernel
-    dim3 blockSize(16, 16);
-    dim3 gridSize((cols + blockSize.x - 1) / blockSize.x,
-                 (rows + blockSize.y - 1) / blockSize.y);
-                 
-    magnitude_x_y_kernel<<<gridSize, blockSize>>>(d_delta_x, d_delta_y, rows, cols, d_magnitude);
-    
-    // Copy results back to host
-    cudaMemcpy(*h_magnitude, d_magnitude, rows * cols * sizeof(short int), cudaMemcpyDeviceToHost);
-    
-    // Free device memory
-    cudaFree(d_delta_x);
-    cudaFree(d_delta_y);
-    cudaFree(d_magnitude);
+   // Execute complete pipeline with single function - minimizes memory transfers
+   complete_canny_pipeline_cuda(image, rows, cols, sigma, tlow, thigh, *edge);
 }

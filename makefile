@@ -33,26 +33,6 @@ run: $(TARGET)
 	./$(TARGET) $(PIC) 2.5 0.25 0.5
 # 			      sigma tlow thigh
 
-benchmark: $(TARGET)
-	@echo "==============================================="
-	@echo "Running benchmark tests..."
-	@echo "==============================================="
-	@for i in 1 2 3; do \
-	    echo "Run $$i:"; \
-	    ./$(TARGET) $(PIC) 2.5 0.25 0.5; \
-	done
-	@echo "==============================================="
-	@echo "Benchmark complete."
-	@echo "==============================================="
-
-profile: $(TARGET)
-	nvprof --metrics achieved_occupancy,sm_efficiency ./$(TARGET) $(PIC) 2.5 0.25 0.5
-
-memory-profile: $(TARGET)
-	nvprof --print-gpu-trace ./$(TARGET) $(PIC) 2.5 0.25 0.5
-
-visual-profile: $(TARGET)
-	nvvp ./$(TARGET) $(PIC) 2.5 0.25 0.5
 
 clean:
 	rm -f $(TARGET) *.o *.pgm *.fim *.nvvp
